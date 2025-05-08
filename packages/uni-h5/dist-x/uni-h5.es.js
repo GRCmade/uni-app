@@ -5734,7 +5734,7 @@ const createIntersectionObserver = /* @__PURE__ */ defineSyncApi("createIntersec
 let reqComponentObserverId = 1;
 class ServiceMediaQueryObserver {
   constructor(component) {
-    this._pageId = component.$page && component.$page.id;
+    this._pageId = (component == null ? void 0 : component.$page) && component.$page.id;
     this._component = component;
   }
   observe(options, callback) {
@@ -23482,6 +23482,7 @@ const request = /* @__PURE__ */ defineTaskApi(
     method,
     dataType: dataType2,
     responseType,
+    enableChunked,
     withCredentials,
     timeout = __uniConfig.networkTimeout.request
   }, { resolve, reject }) => {
@@ -23515,52 +23516,162 @@ const request = /* @__PURE__ */ defineTaskApi(
         }
       }
     }
-    const xhr = new XMLHttpRequest();
-    const requestTask = new RequestTask(xhr);
-    xhr.open(method, url);
-    for (const key in header) {
-      if (hasOwn(header, key)) {
-        xhr.setRequestHeader(key, header[key]);
-      }
-    }
-    const timer = setTimeout(function() {
-      xhr.onload = xhr.onabort = xhr.onerror = null;
-      requestTask.abort();
-      reject("timeout", { errCode: 5 });
-    }, timeout);
-    xhr.responseType = responseType;
-    xhr.onload = function() {
-      clearTimeout(timer);
-      const statusCode = xhr.status;
-      let res = responseType === "text" ? xhr.responseText : xhr.response;
-      if (responseType === "text" && dataType2 === "json") {
-        try {
-          res = UTS.JSON.parse(res);
-        } catch (error) {
+    let requestTask;
+    if (!enableChunked) {
+      const xhr = new XMLHttpRequest();
+      requestTask = new RequestTask(xhr);
+      xhr.open(method, url);
+      for (const key in header) {
+        if (hasOwn(header, key)) {
+          xhr.setRequestHeader(key, header[key]);
         }
       }
-      resolve({
-        data: res,
-        statusCode,
-        header: parseHeaders(xhr.getAllResponseHeaders()),
-        cookies: []
+      const timer = setTimeout(function() {
+        xhr.onload = xhr.onabort = xhr.onerror = null;
+        requestTask.abort();
+        reject("timeout", { errCode: 5 });
+      }, timeout);
+      xhr.responseType = responseType;
+      xhr.onload = function() {
+        clearTimeout(timer);
+        const statusCode = xhr.status;
+        let res = responseType === "text" ? xhr.responseText : xhr.response;
+        if (responseType === "text") {
+          res = parseResponseText(res, responseType, dataType2);
+        }
+        resolve({
+          data: res,
+          statusCode,
+          header: parseHeaders(xhr.getAllResponseHeaders()),
+          cookies: []
+        });
+      };
+      xhr.onabort = function() {
+        clearTimeout(timer);
+        reject("abort", { errCode: 600003 });
+      };
+      xhr.onerror = function() {
+        clearTimeout(timer);
+        reject(void 0, { errCode: 5 });
+      };
+      xhr.withCredentials = withCredentials;
+      xhr.send(body);
+    } else {
+      if (typeof window.fetch === void 0 || typeof window.AbortController === void 0) {
+        throw new Error(
+          "fetch or AbortController is not supported in this environment"
+        );
+      }
+      const controller = new AbortController();
+      const signal = controller.signal;
+      requestTask = new RequestTask(controller);
+      const fetchOptions = {
+        method,
+        headers: header,
+        body,
+        signal,
+        credentials: withCredentials ? "include" : "same-origin"
+      };
+      const timer = setTimeout(function() {
+        requestTask.abort();
+        reject("timeout", { errCode: 5 });
+      }, timeout);
+      fetchOptions.signal.addEventListener("abort", function() {
+        clearTimeout(timer);
+        reject("abort", { errCode: 600003 });
       });
-    };
-    xhr.onabort = function() {
-      clearTimeout(timer);
-      reject("abort", { errCode: 600003 });
-    };
-    xhr.onerror = function() {
-      clearTimeout(timer);
-      reject(void 0, { errCode: 5 });
-    };
-    xhr.withCredentials = withCredentials;
-    xhr.send(body);
+      window.fetch(url, fetchOptions).then(
+        (response) => {
+          const statusCode = response.status;
+          const header2 = response.headers;
+          const body2 = response.body;
+          const headerObj = {};
+          header2.forEach((value, key) => {
+            headerObj[key] = value;
+          });
+          const cookies = cookiesParse(headerObj);
+          requestTask._emitter.emit("headersReceived", {
+            header: headerObj,
+            statusCode,
+            cookies
+          });
+          if (!body2) {
+            resolve({
+              data: "",
+              statusCode,
+              header: headerObj,
+              cookies
+            });
+            return;
+          }
+          const reader = body2.getReader();
+          const bodyBuffers = [];
+          const streamReaderRead = () => {
+            reader.read().then(({ done, value }) => {
+              if (done) {
+                const result = concatArrayBuffers(bodyBuffers);
+                let res = responseType === "text" ? new TextDecoder().decode(result) : result;
+                if (responseType === "text") {
+                  res = parseResponseText(res, responseType, dataType2);
+                }
+                resolve({
+                  data: res,
+                  statusCode,
+                  header: headerObj,
+                  cookies
+                });
+                return;
+              }
+              const chunk = value;
+              bodyBuffers.push(chunk);
+              requestTask._emitter.emit("chunkReceived", {
+                data: chunk
+              });
+              streamReaderRead();
+            });
+          };
+          streamReaderRead();
+        },
+        (error) => {
+          reject(error, { errCode: 5 });
+        }
+      );
+    }
     return requestTask;
   },
   RequestProtocol,
   RequestOptions
 );
+const cookiesParse = (header) => {
+  let cookiesStr = header["Set-Cookie"] || header["set-cookie"];
+  let cookiesArr = [];
+  if (!cookiesStr) {
+    return [];
+  }
+  if (cookiesStr[0] === "[" && cookiesStr[cookiesStr.length - 1] === "]") {
+    cookiesStr = cookiesStr.slice(1, -1);
+  }
+  const handleCookiesArr = cookiesStr.split(";");
+  for (let i = 0; i < handleCookiesArr.length; i++) {
+    if (handleCookiesArr[i].indexOf("Expires=") !== -1 || handleCookiesArr[i].indexOf("expires=") !== -1) {
+      cookiesArr.push(handleCookiesArr[i].replace(",", ""));
+    } else {
+      cookiesArr.push(handleCookiesArr[i]);
+    }
+  }
+  cookiesArr = cookiesArr.join(";").split(",");
+  return cookiesArr;
+};
+function concatArrayBuffers(buffers) {
+  const totalLength = buffers.reduce((acc, buf) => acc + buf.byteLength, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const buffer of buffers) {
+    result.set(new Uint8Array(buffer), offset);
+    offset += buffer.byteLength;
+  }
+  return result.buffer;
+}
 function normalizeContentType(header) {
   const name = Object.keys(header).find(
     (name2) => name2.toLowerCase() === "content-type"
@@ -23577,20 +23688,35 @@ function normalizeContentType(header) {
   return "string";
 }
 class RequestTask {
-  constructor(xhr) {
-    this._xhr = xhr;
+  constructor(controller) {
+    this._emitter = new Emitter();
+    this._controller = controller;
   }
   abort() {
-    if (this._xhr) {
-      this._xhr.abort();
-      delete this._xhr;
+    if (this._controller) {
+      this._controller.abort();
+      delete this._controller;
     }
   }
   onHeadersReceived(callback) {
-    throw new Error("Method not implemented.");
+    this._emitter.on("headersReceived", callback);
   }
   offHeadersReceived(callback) {
-    throw new Error("Method not implemented.");
+    if (callback) {
+      this._emitter.off("headersReceived", callback);
+    } else {
+      this._emitter.off("headersReceived");
+    }
+  }
+  onChunkReceived(callback) {
+    this._emitter.on("chunkReceived", callback);
+  }
+  offChunkReceived(callback) {
+    if (callback) {
+      this._emitter.off("chunkReceived", callback);
+    } else {
+      this._emitter.off("chunkReceived");
+    }
   }
 }
 function parseHeaders(headers) {
@@ -23603,6 +23729,16 @@ function parseHeaders(headers) {
     headersObject[find[1]] = find[2];
   });
   return headersObject;
+}
+function parseResponseText(responseText, responseType, dataType2) {
+  let res = responseText;
+  if (responseType === "text" && dataType2 === "json") {
+    try {
+      res = UTS.JSON.parse(res);
+    } catch (error) {
+    }
+  }
+  return res;
 }
 class DownloadTask {
   constructor(xhr) {
@@ -28618,343 +28754,343 @@ const _sfc_main$1 = {
   }
 };
 const _style_0$1 = `
-@font-face {\r
-    font-family: UniChooseLocationFontFamily;\r
+@font-face {
+    font-family: UniChooseLocationFontFamily;
     src: url('data:font/ttf;charset=utf-8;base64,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') format('truetype');
 }
-.uni-choose-location-icons {\r
-    font-family: "UniChooseLocationFontFamily";\r
-    font-size: 16px;\r
+.uni-choose-location-icons {
+    font-family: "UniChooseLocationFontFamily";
+    font-size: 16px;
     font-style: normal;
 }
-.uni-choose-location {\r
-    position: relative;\r
-    left: 0;\r
-    top: 0;\r
-    width: 100%;\r
-    height: 100%;\r
-    background: #f8f8f8;\r
+.uni-choose-location {
+    position: relative;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background: #f8f8f8;
     z-index: 999;
 }
-.uni-choose-location-map-box {\r
-    position: relative;\r
-    width: 100%;\r
+.uni-choose-location-map-box {
+    position: relative;
+    width: 100%;
     height: 350px;
 }
-.uni-choose-location-map-box.uni-choose-location-vertical {\r
-    transition-property: transform;\r
-    transition-duration: 0.25s;\r
+.uni-choose-location-map-box.uni-choose-location-vertical {
+    transition-property: transform;
+    transition-duration: 0.25s;
     transition-timing-function: ease-out;
 }
-.uni-choose-location-map {\r
-    width: 100%;\r
+.uni-choose-location-map {
+    width: 100%;
     height: 100%;
 }
-.uni-choose-location-map-target {\r
-    position: absolute;\r
-    left: 50%;\r
-    bottom: 50%;\r
-    width: 50px;\r
-    height: 50px;\r
-    margin-left: -25px;\r
-    transition-property: transform;\r
-    transition-duration: 0.25s;\r
+.uni-choose-location-map-target {
+    position: absolute;
+    left: 50%;
+    bottom: 50%;
+    width: 50px;
+    height: 50px;
+    margin-left: -25px;
+    transition-property: transform;
+    transition-duration: 0.25s;
     transition-timing-function: ease-out;
 }
-.uni-choose-location-map-target-icon {\r
-    font-size: 50px;\r
+.uni-choose-location-map-target-icon {
+    font-size: 50px;
     color: #f0493e;
-}\r
-\r
+}
+
   /* #1aad19; #f0493e; #007aff;*/
-.uni-choose-location-map-reset {\r
-    position: absolute;\r
-    left: 20px;\r
-    bottom: 40px;\r
-    width: 40px;\r
-    height: 40px;\r
-    box-sizing: border-box;\r
-    background-color: #fff;\r
-    border-radius: 20px;\r
-    pointer-events: auto;\r
-    box-shadow: 0px 0px 20px 2px rgba(0, 0, 0, .3);\r
-    z-index: 9;\r
-    display: flex;\r
-    justify-content: center;\r
+.uni-choose-location-map-reset {
+    position: absolute;
+    left: 20px;
+    bottom: 40px;
+    width: 40px;
+    height: 40px;
+    box-sizing: border-box;
+    background-color: #fff;
+    border-radius: 20px;
+    pointer-events: auto;
+    box-shadow: 0px 0px 20px 2px rgba(0, 0, 0, .3);
+    z-index: 9;
+    display: flex;
+    justify-content: center;
     align-items: center;
 }
-.uni-choose-location-map-reset.uni-choose-location-vertical {\r
-    transition-property: transform;\r
-    transition-duration: 0.25s;\r
+.uni-choose-location-map-reset.uni-choose-location-vertical {
+    transition-property: transform;
+    transition-duration: 0.25s;
     transition-timing-function: ease-out;
 }
-.uni-choose-location-map-reset-icon {\r
-    font-size: 26px;\r
-    text-align: center;\r
+.uni-choose-location-map-reset-icon {
+    font-size: 26px;
+    text-align: center;
     line-height: 40px;
 }
-.uni-choose-location-nav {\r
-    position: absolute;\r
-    top: 0;\r
-    left: 0;\r
-    width: 100%;\r
-    height: 60px;\r
-    background-color: rgba(0, 0, 0, 0);\r
+.uni-choose-location-nav {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 60px;
+    background-color: rgba(0, 0, 0, 0);
     background-image: linear-gradient(to bottom, rgba(0, 0, 0, .6), rgba(0, 0, 0, 0));
 }
-.uni-choose-location-nav-btn {\r
-    position: absolute;\r
-    top: 5px;\r
-    left: 5px;\r
-    width: 64px;\r
-    height: 44px;\r
+.uni-choose-location-nav-btn {
+    position: absolute;
+    top: 5px;
+    left: 5px;
+    width: 64px;
+    height: 44px;
     padding: 5px;
 }
-.uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn {\r
-    left: auto;\r
+.uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn {
+    left: auto;
     right: 5px;
 }
-.uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn .uni-choose-location-nav-confirm-text {\r
-    background-color: #007aff;\r
+.uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn .uni-choose-location-nav-confirm-text {
+    background-color: #007aff;
     border-radius: 5px;
 }
-.uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn.active:active {\r
+.uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn.active:active {
     opacity: 0.7;
 }
-.uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn.disable {\r
+.uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn.disable {
     opacity: 0.4;
 }
-.uni-choose-location-nav-btn.uni-choose-location-nav-back-btn .uni-choose-location-nav-back-text {\r
+.uni-choose-location-nav-btn.uni-choose-location-nav-back-btn .uni-choose-location-nav-back-text {
     color: #fff;
 }
-.uni-choose-location-nav-text {\r
-    padding: 8px 0px;\r
-    font-size: 14px;\r
-    text-align: center;\r
-\r
-    letter-spacing: 0.1em;\r
-\r
+.uni-choose-location-nav-text {
+    padding: 8px 0px;
+    font-size: 14px;
+    text-align: center;
+
+    letter-spacing: 0.1em;
+
     color: #fff;
 }
-.uni-choose-location-poi {\r
-    position: absolute;\r
-    top: 350px;\r
-    width: 100%;\r
-    bottom: 0;\r
-    background-color: #fff;\r
+.uni-choose-location-poi {
+    position: absolute;
+    top: 350px;
+    width: 100%;
+    bottom: 0;
+    background-color: #fff;
     z-index: 10
 }
-.uni-choose-location-poi.uni-choose-location-vertical {\r
-    transition-property: top;\r
-    transition-duration: 0.25s;\r
+.uni-choose-location-poi.uni-choose-location-vertical {
+    transition-property: top;
+    transition-duration: 0.25s;
     transition-timing-function: ease-out;
 }
-.uni-choose-location-poi-search {\r
-    display: flex;\r
-    flex-direction: row;\r
-    align-items: center;\r
-    justify-content: center;\r
-    height: 50px;\r
-    padding: 8px;\r
+.uni-choose-location-poi-search {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    height: 50px;
+    padding: 8px;
     background-color: #fff;
 }
-.uni-choose-location-poi-search-box {\r
-    display: flex;\r
-    flex-direction: row;\r
-    align-items: center;\r
-    justify-content: center;\r
-    height: 32px;\r
-    flex: 1;\r
-    border-radius: 5px;\r
-    padding: 0 15px;\r
+.uni-choose-location-poi-search-box {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    height: 32px;
+    flex: 1;
+    border-radius: 5px;
+    padding: 0 15px;
     background-color: #ededed;
 }
-.uni-choose-location-poi-search-input {\r
-    flex: 1;\r
-    height: 100%;\r
-    border-radius: 5px;\r
-    padding: 0 5px;\r
+.uni-choose-location-poi-search-input {
+    flex: 1;
+    height: 100%;
+    border-radius: 5px;
+    padding: 0 5px;
     background: #ededed;
 }
-.uni-choose-location-poi-search-cancel {\r
-    margin-left: 5px;\r
-    color: #007aff;\r
-    font-size: 15px;\r
+.uni-choose-location-poi-search-cancel {
+    margin-left: 5px;
+    color: #007aff;
+    font-size: 15px;
     text-align: center;
 }
-.uni-choose-location-poi-list {\r
+.uni-choose-location-poi-list {
     flex: 1;
 }
-.uni-choose-location-poi-search-loading {\r
-    display: flex;\r
-    align-items: center;\r
+.uni-choose-location-poi-search-loading {
+    display: flex;
+    align-items: center;
     padding: 10px 0px;
 }
-.uni-choose-location-poi-search-loading-text {\r
+.uni-choose-location-poi-search-loading-text {
     color: #191919;
 }
-.uni-choose-location-poi-search-error {\r
-    display: flex;\r
-    align-items: center;\r
+.uni-choose-location-poi-search-error {
+    display: flex;
+    align-items: center;
     padding: 10px;
 }
-.uni-choose-location-poi-search-error-text {\r
-    color: #191919;\r
+.uni-choose-location-poi-search-error-text {
+    color: #191919;
     font-size: 14px;
 }
-.uni-choose-location-poi-item {\r
-    position: relative;\r
-    padding: 15px 10px;\r
+.uni-choose-location-poi-item {
+    position: relative;
+    padding: 15px 10px;
     padding-right: 40px;
 }
-.uni-choose-location-poi-item-title-text {\r
-    font-size: 14px;\r
-    overflow: hidden;\r
-    white-space: nowrap;\r
-    text-overflow: ellipsis;\r
+.uni-choose-location-poi-item-title-text {
+    font-size: 14px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
     color: #191919;
 }
-.uni-choose-location-poi-item-detail-text {\r
-    font-size: 12px;\r
-    margin-top: 5px;\r
-    color: #b2b2b2;\r
-    overflow: hidden;\r
-    white-space: nowrap;\r
+.uni-choose-location-poi-item-detail-text {
+    font-size: 12px;
+    margin-top: 5px;
+    color: #b2b2b2;
+    overflow: hidden;
+    white-space: nowrap;
     text-overflow: ellipsis;
 }
-.uni-choose-location-poi-item-selected-icon {\r
-    position: absolute;\r
-    top: 50%;\r
-    right: 10px;\r
-    width: 26px;\r
-    height: 26px;\r
-    margin-top: -13px;\r
-    color: #007aff;\r
+.uni-choose-location-poi-item-selected-icon {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    width: 26px;
+    height: 26px;
+    margin-top: -13px;
+    color: #007aff;
     font-size: 24px;
 }
-.uni-choose-location-poi-item-after {\r
-    position: absolute;\r
-    height: 1px;\r
-    left: 10px;\r
-    bottom: 0px;\r
-    right: 10px;\r
-    width: auto;\r
+.uni-choose-location-poi-item-after {
+    position: absolute;
+    height: 1px;
+    left: 10px;
+    bottom: 0px;
+    right: 10px;
+    width: auto;
     border-bottom: 1px solid #f8f8f8;
 }
-.uni-choose-location-search-icon {\r
-    color: #808080;\r
+.uni-choose-location-search-icon {
+    color: #808080;
     padding-left: 5px;
 }
-.uni-choose-location-poi-search-loading-image {\r
-    width: 28px;\r
-    height: 28px;\r
-    transition-property: transform;\r
-    transition-duration: 0.2s;\r
+.uni-choose-location-poi-search-loading-image {
+    width: 28px;
+    height: 28px;
+    transition-property: transform;
+    transition-duration: 0.2s;
     transition-timing-function: linear;
-}\r
-\r
+}
+
   /* 横屏样式开始 */
-.uni-choose-location .uni-choose-location-map-box.uni-choose-location-landscape {\r
+.uni-choose-location .uni-choose-location-map-box.uni-choose-location-landscape {
     height: 100%;
 }
-.uni-choose-location .uni-choose-location-poi.uni-choose-location-landscape {\r
-    position: absolute;\r
-    top: 80px;\r
-    right: 25px;\r
-    width: 300px;\r
-    bottom: 20px;\r
-    max-height: 600px;\r
-    box-shadow: 0px 0px 20px 2px rgba(0, 0, 0, .3);\r
+.uni-choose-location .uni-choose-location-poi.uni-choose-location-landscape {
+    position: absolute;
+    top: 80px;
+    right: 25px;
+    width: 300px;
+    bottom: 20px;
+    max-height: 600px;
+    box-shadow: 0px 0px 20px 2px rgba(0, 0, 0, .3);
     border-radius: 5px;
 }
-.uni-choose-location .uni-choose-location-map-reset.uni-choose-location-landscape {\r
-    left: 40px;\r
+.uni-choose-location .uni-choose-location-map-reset.uni-choose-location-landscape {
+    left: 40px;
     bottom: 40px;
 }
-.uni-choose-location .uni-choose-location-poi-item.uni-choose-location-landscape {\r
+.uni-choose-location .uni-choose-location-poi-item.uni-choose-location-landscape {
     padding: 10px;
 }
-.uni-choose-location .uni-choose-location-nav-btn.uni-choose-location-landscape {\r
-    top: 10px;\r
+.uni-choose-location .uni-choose-location-nav-btn.uni-choose-location-landscape {
+    top: 10px;
     left: 20px;
 }
-.uni-choose-location .uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn.uni-choose-location-landscape {\r
-    left: auto;\r
+.uni-choose-location .uni-choose-location-nav-btn.uni-choose-location-nav-confirm-btn.uni-choose-location-landscape {
+    left: auto;
     right: 20px;
-}\r
-\r
-  /* 横屏样式结束 */\r
-\r
+}
+
+  /* 横屏样式结束 */
+
   /* 暗黑模式样式开始 */
-.uni-choose-location-dark .uni-choose-location-map-reset {\r
-    background-color: #111111;\r
+.uni-choose-location-dark .uni-choose-location-map-reset {
+    background-color: #111111;
     box-shadow: 0px 0px 5px 1px rgba(0, 0, 0, .3);
 }
-.uni-choose-location-dark .uni-choose-location-poi-search-box {\r
+.uni-choose-location-dark .uni-choose-location-poi-search-box {
     background-color: #111111;
 }
-.uni-choose-location-dark .uni-choose-location-search-icon {\r
+.uni-choose-location-dark .uni-choose-location-search-icon {
     color: #d1d1d1;
 }
-.uni-choose-location-dark .uni-choose-location-poi-search-loading-text {\r
+.uni-choose-location-dark .uni-choose-location-poi-search-loading-text {
     color: #d1d1d1;
 }
-.uni-choose-location-dark .uni-choose-location-poi-search {\r
+.uni-choose-location-dark .uni-choose-location-poi-search {
     background-color: #181818
 }
-.uni-choose-location-dark .uni-choose-location-poi-search-input {\r
-    background: #111111;\r
+.uni-choose-location-dark .uni-choose-location-poi-search-input {
+    background: #111111;
     color: #d1d1d1;
 }
-.uni-choose-location-dark .uni-choose-location-poi-item-title-text {\r
+.uni-choose-location-dark .uni-choose-location-poi-item-title-text {
     color: #d1d1d1;
 }
-.uni-choose-location-dark .uni-choose-location-poi-item-detail-text {\r
+.uni-choose-location-dark .uni-choose-location-poi-item-detail-text {
     color: #595959;
 }
-.uni-choose-location-dark .uni-choose-location-poi {\r
+.uni-choose-location-dark .uni-choose-location-poi {
     background-color: #181818
 }
-.uni-choose-location-dark .uni-choose-location-poi-item-after {\r
+.uni-choose-location-dark .uni-choose-location-poi-item-after {
     border-bottom: 1px solid #1e1e1e;
 }
-.uni-choose-location-dark .uni-choose-location-map-reset-icon {\r
+.uni-choose-location-dark .uni-choose-location-map-reset-icon {
     color: #d1d1d1;
 }
-.uni-choose-location-dark .uni-choose-location-poi-search-error-text {\r
+.uni-choose-location-dark .uni-choose-location-poi-search-error-text {
     color: #d1d1d1;
-}\r
-\r
+}
+
   /* 暗黑模式样式结束 */
-uni-image {\r
-    display: inline-block;\r
-    overflow: hidden;\r
+uni-image {
+    display: inline-block;
+    overflow: hidden;
     position: relative;
 }
-uni-image[hidden] {\r
+uni-image[hidden] {
     display: none;
 }
-uni-image > div {\r
-    width: 100%;\r
-    height: 100%;\r
+uni-image > div {
+    width: 100%;
+    height: 100%;
     background-repeat: no-repeat;
 }
-uni-image > img {\r
-    -webkit-touch-callout: none;\r
-    user-select: none;\r
-    display: block;\r
-    position: absolute;\r
-    top: 0;\r
-    left: 0;\r
-    width: 100%;\r
-    height: 100%;\r
+uni-image > img {
+    -webkit-touch-callout: none;
+    user-select: none;
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
     opacity: 0;
 }
-uni-image > .uni-image-will-change {\r
+uni-image > .uni-image-will-change {
     will-change: transform;
-}\r
-\r
-\r
+}
+
+
 `;
 function _sfc_render$1(_ctx, _cache, $props, $setup, $data, $options) {
   const _component_map = __syscom_0;
@@ -29667,7 +29803,7 @@ const showModal = (options) => {
     (_b2 = options.complete) == null ? void 0 : _b2.call(options, res);
   });
   let openRet = uni.openDialogPage({
-    url: `uni:uniModal?readyEventName=${readyEventName}&optionsEventName=${optionsEventName}&successEventName=${successEventName}&failEventName=${failEventName}`,
+    url: `/uni_modules/uni-modal/pages/uniModal/uniModal?readyEventName=${readyEventName}&optionsEventName=${optionsEventName}&successEventName=${successEventName}&failEventName=${failEventName}`,
     fail(err) {
       var _a2, _b2;
       const res = new UniShowModalFailImpl(`showModal failed, ${err.errMsg}`);
